@@ -2,7 +2,14 @@
 name = "mlx-quant-mcp"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["mcp"]
+dependencies = ["mcp>=2.3,<3"]
 
 [project.scripts]
 mlx-quant-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]

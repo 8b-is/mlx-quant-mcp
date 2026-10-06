@@ -13,11 +13,12 @@ Requires MLX-QUANT installed (pip install mlx).
 Uses Apple Silicon GPU (Metal) when available, CPU fallback otherwise.
 """
 import json
+import math
+import struct
 import mlx.core as mx
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.mcpserver import MCPServer
 
-server = Server("mlx-quant-mcp")
+server = MCPServer("mlx-quant-mcp")
 
 @server.tool()
 async def quantize(shape: str = "64,64", mode: str = "ternary", group_size: int = 64, bits: int = 2) -> str:
@@ -37,15 +38,36 @@ async def quantize(shape: str = "64,64", mode: str = "ternary", group_size: int 
 
 @server.tool()
 async def dequantize(codes_b64: str, scales: str, shape: str = "64,64", group_size: int = 64, bits: int = 2) -> str:
-    """Dequantize packed codes back to fp32. codes_b64: base64-encoded packed uint32."""
+    """Dequantize little-endian packed uint32 codes. shape is the output rows,cols."""
     import base64
+    import binascii
     dims = [int(x) for x in shape.split(",")]
-    s = mx.array(json.loads(scales))
-    packed = base64.b64decode(codes_b64)
-    codes = mx.array(list(packed), dtype=mx.uint32)
+    if len(dims) != 2 or any(d <= 0 for d in dims):
+        raise ValueError("shape must contain two positive dimensions")
+    rows, cols = dims
+    if bits != 2 or group_size <= 0 or cols % group_size or cols % 16:
+        raise ValueError("ternary requires bits=2 and columns divisible by group_size and 16")
+    try:
+        packed = base64.b64decode(codes_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("codes_b64 must be valid base64") from exc
+    expected_bytes = rows * (cols // 16) * 4
+    if len(packed) != expected_bytes:
+        raise ValueError(f"packed codes must contain exactly {expected_bytes} bytes")
+    scale_values = json.loads(scales)
+    if not isinstance(scale_values, list) or len(scale_values) != rows:
+        raise ValueError("scales must have shape rows,cols/group_size")
+    for row in scale_values:
+        if not isinstance(row, list) or len(row) != cols // group_size:
+            raise ValueError("scales must have shape rows,cols/group_size")
+        if any(type(v) not in (int, float) or not math.isfinite(v) for v in row):
+            raise ValueError("scales must contain finite numbers")
+    words = [word[0] for word in struct.iter_unpack("<I", packed)]
+    codes = mx.array(words, dtype=mx.uint32).reshape((rows, cols // 16))
+    s = mx.array(scale_values, dtype=mx.float32)
     w_hat = mx.dequantize(codes, s, group_size=group_size, bits=bits, mode="ternary")
     mx.eval(w_hat)
-    return json.dumps({"shape": dims, "dequantized_sample": w_hat.flatten().tolist()[:8]})
+    return json.dumps({"shape": list(w_hat.shape), "dequantized_sample": w_hat.flatten().tolist()[:8]})
 
 @server.tool()
 async def matmul(rows: int = 1, K: int = 64, N: int = 64, mode: str = "ternary") -> str:
@@ -82,10 +104,9 @@ async def info() -> str:
         "tests": "260/260 doctests passing",
     })
 
-async def main():
-    async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+def main():
+    server.run(transport="stdio")
+
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
